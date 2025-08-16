@@ -732,6 +732,10 @@ def parse_symbols() -> List[str]:
     the function returns the full universe from `fetch_all_symbols()`.  Otherwise
     it parses `SYMBOL_LIST` (a comma‑separated list).  If `SYMBOL_LIST` is not
     provided, it defaults to the 30 Dow Jones Industrial Average constituents.
+
+    When `USE_YFINANCE` is the only data source, scanning the full universe
+    can be slow.  Consider specifying a shorter `SYMBOL_LIST` to reduce
+    runtime.  This helper hides these details from callers.
     """
     scan_all = os.getenv('SCAN_ALL', 'false').lower() in {'1', 'true', 'yes'}
     if scan_all:
@@ -747,6 +751,150 @@ def parse_symbols() -> List[str]:
         'KO', 'HD', 'INTC', 'CRM', 'MCD', 'CAT', 'HON', 'GS', 'DIS', 'VZ',
         'NKE', 'TRV', 'AXP', 'BA', 'MRK', 'CSCO', 'CVX', 'DOW', 'AMGN', 'MMM',
     ]
+
+
+# ============================================================================
+# Advanced scanning helpers (yfinance‑only implementation)
+#
+# The functions below implement a simplified version of the "Best‑of‑Best"
+# scanning process described in the outline.  Without access to real‑time news
+# and dual‑feed market data, these helpers rely on the free `yfinance` data
+# source to estimate volume, momentum and volatility.  They assign a
+# rudimentary confidence score to each symbol and build candidate spreads
+# accordingly.  These features do not guarantee profitability and are
+# illustrative only.
+# ==========================================================================
+
+def compute_intraday_metrics(symbol: str) -> Optional[Dict[str, float]]:
+    """Compute simple intraday metrics for a symbol using `yfinance`.
+
+    This function fetches 1‑minute bars for the current trading day (if
+    available) and returns a dictionary with:
+
+    - 'price_change': percentage change from previous close to the latest
+      bar (as a float between -1 and 1).
+    - 'rvol': relative volume (volume today vs average volume over the past
+      five trading days).  Values >1 indicate higher‑than‑normal activity.
+    - 'iv': average implied volatility of near‑term options (if available).
+
+    Returns None if data cannot be retrieved or computed.
+    """
+    if not _HAS_YFINANCE:
+        return None
+    try:
+        ticker = yf.Ticker(symbol)
+        # Daily history for last 7 days to compute average volume
+        hist_daily = ticker.history(period="7d", interval="1d")
+        if hist_daily.empty or len(hist_daily) < 2:
+            return None
+        prev_close = float(hist_daily['Close'].iloc[-2])
+        avg_vol = float(hist_daily['Volume'].iloc[-6:-1].mean()) if len(hist_daily) >= 6 else float(hist_daily['Volume'].mean())
+        # Intraday 1‑minute bars for today
+        hist_min = ticker.history(period="1d", interval="1m")
+        if hist_min.empty:
+            return None
+        last_row = hist_min.iloc[-1]
+        latest_close = float(last_row['Close'])
+        cum_vol = float(hist_min['Volume'].sum())
+        price_change = (latest_close - prev_close) / prev_close
+        rvol = cum_vol / avg_vol if avg_vol else 0.0
+        # Fetch options chain to estimate an implied volatility average
+        iv = None
+        if use_yfinance := (os.getenv('USE_YFINANCE', 'false').lower() in {'1', 'true', 'yes'}):
+            try:
+                opts = ticker.options
+                if opts:
+                    # Use nearest expiration to estimate IV
+                    exp = opts[0]
+                    chain = ticker.option_chain(exp)
+                    vols = []
+                    for df in [chain.calls, chain.puts]:
+                        # filter out invalid values
+                        vols.extend([iv for iv in df.get('impliedVolatility', []) if iv == iv])
+                    if vols:
+                        iv = sum(vols) / len(vols)
+            except Exception:
+                pass
+        return {
+            'price_change': price_change,
+            'rvol': rvol,
+            'iv': iv or 0.0,
+        }
+    except Exception:
+        return None
+
+
+def compute_confidence(metrics: Dict[str, float]) -> float:
+    """Compute a rudimentary confidence score (0–100) from intraday metrics.
+
+    The score weighs momentum (price change), relative volume (RVOL) and
+    implied volatility (IV).  A higher RVOL and positive price change increase
+    the score; extremely high IV reduces the score to reflect heightened
+    uncertainty.  This heuristic is simplistic and intended as a stand‑in
+    for more sophisticated signal blending.
+    """
+    score = 0.0
+    # Momentum component: scale 50 points across ±5% price change
+    momentum = max(min(metrics.get('price_change', 0.0), 0.05), -0.05)
+    score += (momentum / 0.05) * 30.0  # ±30 pts
+    # Relative volume: up to 40 points at rvol ≥ 5
+    rvol = metrics.get('rvol', 1.0)
+    rvol_points = min(rvol / 5.0, 1.0) * 40.0
+    score += rvol_points
+    # Implied volatility penalty: subtract up to 20 points when IV > 0.6
+    iv = metrics.get('iv', 0.0)
+    if iv > 0.6:
+        penalty = min((iv - 0.6) / 0.4, 1.0) * 20.0
+        score -= penalty
+    # Clip to 0–100
+    return max(0.0, min(100.0, 50.0 + score))
+
+
+def pre_market_scan(symbols: List[str], max_candidates: int = 50) -> List[Tuple[str, Strategy, float]]:
+    """Perform a simplified pre‑market scan and return top candidates.
+
+    For each symbol, this function computes intraday metrics, derives a
+    confidence score, and generates a candidate vertical spread using
+    `identify_candidate_trades`.  It returns a list of tuples
+    (description, strategy, confidence) sorted by descending confidence.
+
+    The number of returned candidates is capped by `max_candidates`.  When
+    metrics cannot be computed or no trades are available, the symbol is
+    skipped.
+    """
+    results: List[Tuple[str, Strategy, float]] = []
+    for sym in symbols:
+        metrics = compute_intraday_metrics(sym)
+        if not metrics:
+            continue
+        conf = compute_confidence(metrics)
+        trades = identify_candidate_trades(sym)
+        if not trades:
+            continue
+        # Use the first trade idea as a representative; additional ideas
+        # could be considered in a more exhaustive implementation.
+        desc, strat = trades[0]
+        results.append((desc, strat, conf))
+    # Sort by confidence descending and truncate
+    results.sort(key=lambda x: x[2], reverse=True)
+    return results[:max_candidates]
+
+
+def print_go_cards(candidates: List[Tuple[str, Strategy, float]]) -> None:
+    """Pretty‑print the selected trade ideas as "GO" cards.
+
+    Each candidate is displayed with its description, confidence score,
+    estimated max gain/loss and risk level.  In a more feature‑rich system
+    this function could write to a spreadsheet or broker ticket template.
+    """
+    print("\n===== GO CARDS =====")
+    for idx, (desc, strat, conf) in enumerate(candidates, start=1):
+        mg = strat.max_gain()
+        ml = strat.max_loss()
+        print(f"{idx}. {desc}")
+        print(f"   Confidence: {conf:.1f}/100  Risk Level: {strat.risk_level()}")
+        print(f"   Max Gain: {mg if mg is not None else 'Unlimited'}  Max Loss: {ml if ml is not None else 'Unlimited'}")
+    print("====================\n")
 
 
 def get_scan_times() -> List[_dt.time]:
@@ -796,8 +944,15 @@ def main() -> None:
     # Learn from previous records
     if trade_log:
         learn_from_records(learner, trade_log)
-    # Immediately run one scan on start
-    print(f"Initial scan at { _dt.datetime.now().strftime('%Y-%m-%d %H:%M') }")
+    # Immediately run one pre‑market scan on start using intraday metrics.
+    print(f"Initial pre‑market scan at { _dt.datetime.now().strftime('%Y-%m-%d %H:%M') }")
+    try:
+        candidates = pre_market_scan(symbols)
+        if candidates:
+            print_go_cards(candidates)
+    except Exception as exc:
+        print(f"Pre‑market scan failed: {exc}")
+    # Run a conventional scan to update RL and trade log
     scan_once(symbols, learner, trade_log)
     save_trade_records(trade_log)
     while True:
