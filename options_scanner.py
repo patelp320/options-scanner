@@ -49,13 +49,11 @@ python options_scanner.py
 
 Environment Variables
 ---------------------
-
 Several optional environment variables can be set to configure the scanner:
 
 ```
-NEWS_API_KEY        API key for a news service (e.g. newsapi.org)
-SOCIAL_API_KEY      API key for a social sentiment service (e.g. Twitter)
-DATA_API_KEY        API key for a market data service (e.g. Finnhub, IEX Cloud)
+USE_YFINANCE        If "true", use the `yfinance` library to pull stock
+                    prices and options chains from Yahoo Finance (default: false).
 SYMBOL_LIST         Comma‑separated list of tickers to monitor (default: the
                     30 stocks of the Dow Jones Industrial Average)
 TIMEZONE            Time zone in which to schedule scans (default: America/New_York)
@@ -63,14 +61,18 @@ SCAN_TIMES          Comma‑separated local times at which to run the scanner
                     (default: "09:35,10:30")
 ```
 
+You may also set `NEWS_API_KEY`, `SOCIAL_API_KEY` and `DATA_API_KEY` if you
+decide to integrate third‑party news, sentiment or market data services in
+the future.  These are not required when using `yfinance`.
+
 Notes
 -----
 
-1. The scanner relies on external APIs for real‑time options and underlying
-   data.  Without valid API keys the `fetch_*` functions will return empty
-   structures and the scanner will not generate trade ideas.  You can
-   implement these functions to retrieve data from sources such as Finnhub,
-   AlphaVantage, IEX Cloud, Yahoo Finance or your broker’s API.
+1. By default the scanner uses Yahoo Finance via `yfinance` for market
+   data when `USE_YFINANCE=true`.  This data is provided without API keys but
+   may be delayed or incomplete.  If you choose to integrate another data
+   source or broker API, implement the `fetch_*` functions accordingly and
+   set the appropriate API keys via environment variables.
 2. Scheduling uses the built‑in `time` module rather than external
    dependencies.  This keeps the requirements minimal but also means the
    script must run continuously to trigger at the right times.
@@ -90,6 +92,32 @@ import os
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+
+# Attempt to import yfinance for free market data.  This optional
+# dependency allows the scanner to retrieve stock prices and options
+# chains without requiring a paid API key.  If not installed, the
+# functions will fall back to returning None or an empty list.  Install
+# via `pip install yfinance`.
+try:
+    import yfinance as yf  # type: ignore
+    _HAS_YFINANCE = True
+except Exception:
+    _HAS_YFINANCE = False
+
+# ===========================================================================
+# NOTE ON RESPONSIBLE USE
+#
+# The additions below introduce a simple reinforcement‑learning (RL) framework
+# and performance logging infrastructure.  RL can help discover patterns
+# through trial and error, learning to favour actions that historically led to
+# positive rewards.  However, financial markets are noisy and non‑stationary,
+# which makes RL particularly challenging【291481126490656†L623-L651】.  Random noise
+# or one‑off events may be mistaken for meaningful signals【291481126490656†L655-L668】,
+# and the agent may overfit to past conditions.  Implementers must be
+# cautious: backtest thoroughly, validate models out‑of‑sample, monitor
+# performance and incorporate human oversight【848725721887257†L94-L122】.  These
+# examples are for educational purposes and do not guarantee any profits.
+
 
 
 ###############################################################################
@@ -206,6 +234,159 @@ class Strategy:
         return 'High'
 
 
+# ---------------------------------------------------------------------------
+# Trade logging and reinforcement learning
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TradeRecord:
+    """Represents the outcome of a historical trade.
+
+    This data structure is used for self‑learning.  Each record stores
+    metadata about the trade (symbol, strategy type, entry/exit prices and
+    timestamps) along with the realised profit or loss.  These records
+    populate the RL agent’s experience buffer.
+    """
+    symbol: str
+    strategy_type: str
+    entry_date: str
+    exit_date: Optional[str]
+    entry_price: float
+    exit_price: Optional[float]
+    max_gain: Optional[float]
+    max_loss: Optional[float]
+    result: Optional[float]  # profit/loss; positive for profit, negative for loss
+    state: Tuple  # representation of the market state when trade was opened
+    next_state: Optional[Tuple]
+
+
+class ReinforcementLearner:
+    """Simple tabular Q‑learning agent for trade recommendation.
+
+    The agent learns to map discrete market "states" to actions (strategy
+    identifiers) based on realised rewards.  It uses an ε‑greedy policy
+    during action selection and updates its Q‑table using the Bellman
+    equation.  In practice, continuous state spaces require function
+    approximation (e.g. neural networks), but this prototype keeps things
+    simple for illustration.
+    """
+
+    def __init__(self) -> None:
+        # Q‑table: {state: {action: value}}
+        self.q_table: Dict[Tuple, Dict[str, float]] = {}
+
+    def get_action(self, state: Tuple, possible_actions: List[str], epsilon: float = 0.1) -> str:
+        """Choose an action using ε‑greedy selection.
+
+        With probability ε, select a random action to encourage exploration;
+        otherwise, select the action with the highest Q‑value for the given
+        state.  If the state is unseen, it initialises Q‑values to zero.
+        """
+        if state not in self.q_table:
+            self.q_table[state] = {a: 0.0 for a in possible_actions}
+        # Exploration
+        import random
+        if random.random() < epsilon:
+            return random.choice(possible_actions)
+        # Exploitation
+        action_values = self.q_table[state]
+        return max(action_values, key=action_values.get)
+
+    def update(self, state: Tuple, action: str, reward: float, next_state: Tuple, alpha: float = 0.1, gamma: float = 0.9) -> None:
+        """Update the Q‑table based on an observed transition.
+
+        Args:
+            state: The previous state.
+            action: The action taken in the previous state.
+            reward: The reward obtained after taking the action.
+            next_state: The state after taking the action.
+            alpha: Learning rate (0 < alpha ≤ 1).
+            gamma: Discount factor (0 ≤ gamma < 1) determining future reward weight.
+        """
+        if state not in self.q_table:
+            self.q_table[state] = {action: 0.0}
+        if next_state not in self.q_table:
+            self.q_table[next_state] = {action: 0.0}
+        old_value = self.q_table[state].get(action, 0.0)
+        next_max = max(self.q_table[next_state].values()) if self.q_table[next_state] else 0.0
+        # Q‑learning update rule
+        new_value = old_value + alpha * (reward + gamma * next_max - old_value)
+        self.q_table[state][action] = new_value
+
+
+def extract_state(symbol: str) -> Tuple:
+    """Derive a simplified market state representation for RL.
+
+    In a real implementation, the state could include technical indicators
+    (e.g. moving averages, RSI), volatility, implied volatility skew, news
+    sentiment and macro factors.  Here we use a placeholder: the current
+    underlying price rounded to the nearest whole number.  Extend this
+    function to incorporate your preferred features.
+    """
+    price = fetch_underlying_price(symbol)
+    if price is None:
+        # Unknown price becomes a generic state
+        return ('unknown',)
+    # Round to reduce dimensionality (binning)
+    return (round(price),)
+
+
+def compute_reward(record: TradeRecord) -> float:
+    """Compute a binary reward based on the trade outcome.
+
+    Reinforcement learning in trading often benefits from simple rewards
+    (positive for profitable trades, negative for losses)【291481126490656†L270-L279】.  This
+    encourages consistent positive returns rather than chasing outsized gains.
+    """
+    if record.result is None:
+        return 0.0
+    return 1.0 if record.result > 0 else -1.0
+
+
+def load_trade_records(path: str = 'trade_log.json') -> List[TradeRecord]:
+    """Load historical trade records from disk for learning.
+
+    The file should contain a list of dictionaries matching the TradeRecord
+    fields.  Returns an empty list if no file exists.  Errors are ignored.
+    """
+    try:
+        with open(path, 'r') as f:
+            data = json.load(f)
+        records: List[TradeRecord] = []
+        for item in data:
+            records.append(TradeRecord(**item))
+        return records
+    except Exception:
+        return []
+
+
+def save_trade_records(records: List[TradeRecord], path: str = 'trade_log.json') -> None:
+    """Persist trade records to a JSON file."""
+    try:
+        serialisable = [dataclasses.asdict(r) for r in records]
+        with open(path, 'w') as f:
+            json.dump(serialisable, f, indent=2)
+    except Exception as exc:
+        print(f"Could not save trade log: {exc}")
+
+
+def learn_from_records(learner: ReinforcementLearner, records: List[TradeRecord]) -> None:
+    """Update the RL agent using historical trade records.
+
+    For each record where the trade has been closed (i.e. `result` and
+    `next_state` are defined), compute a simple binary reward and update
+    the Q‑table accordingly.  This method can be extended to use more
+    sophisticated reward structures or discounting based on trade length.
+    """
+    for record in records:
+        if record.result is not None and record.next_state is not None:
+            reward = compute_reward(record)
+            # Use the strategy type as the action identifier
+            action = record.strategy_type
+            learner.update(record.state, action, reward, record.next_state)
+
+
+
 @dataclass
 class CoveredCall(Strategy):
     """Implements a covered call strategy.
@@ -312,11 +493,14 @@ class IronCondor(Strategy):
 ###############################################################################
 
 def fetch_trending_symbols() -> List[str]:
-    """Fetch a list of trending symbols based on news and social sentiment.
+    """Return a list of trending symbols.
 
-    Returns an empty list by default.  To enable, implement calls to a news
-    API (e.g. NewsAPI.org) and a social sentiment API (e.g. Twitter) and
-    return a deduplicated list of tickers (e.g. ['AAPL', 'TSLA']).
+    Without third‑party APIs this function simply returns an empty list.
+    You can manually populate a list here if you wish to monitor specific
+    tickers beyond the static `SYMBOL_LIST`.  If you have access to a
+    sentiment data feed, you can implement a call here.  For simplicity,
+    this prototype relies solely on the watch list provided via
+    `SYMBOL_LIST` or `USE_YFINANCE` when scanning the market.
     """
     return []
 
@@ -324,30 +508,72 @@ def fetch_trending_symbols() -> List[str]:
 def fetch_options_chain(symbol: str) -> List[Dict[str, object]]:
     """Retrieve the options chain for a given symbol.
 
-    Each entry in the returned list should contain at least the following keys:
-    ``expiry``, ``strike``, ``option_type`` ('call' or 'put'), ``bid``, ``ask``,
-    ``last``, ``volume``, ``open_interest``.  Data should be for the nearest
-    weekly expiry (or 0DTE if scanning intraday).  To implement this function
-    you can use a third‑party service (Finnhub, AlphaVantage, IEX Cloud, etc.)
-    or broker APIs.  Without a data source the function returns an empty
-    list.
+    The scanner uses Yahoo Finance via the optional `yfinance` library to
+    obtain the nearest expiry options chain when `USE_YFINANCE=true` and
+    `yfinance` is installed.  Each entry in the returned list contains
+    the fields ``expiry``, ``strike``, ``option_type`` ('call' or 'put'),
+    ``bid``, ``ask``, ``last``, ``volume`` and ``open_interest``.  If
+    `yfinance` is unavailable or disabled, the function returns an
+    empty list.
     """
+    # First attempt to use yfinance if available and enabled via environment
+    use_yf = os.getenv('USE_YFINANCE', 'false').lower() in {'1', 'true', 'yes'}
+    if use_yf and _HAS_YFINANCE:
+        try:
+            ticker = yf.Ticker(symbol)
+            expiries = ticker.options
+            if not expiries:
+                return []
+            # Choose the nearest expiry
+            expiry = sorted(expiries)[0]
+            chain = ticker.option_chain(expiry)
+            records: List[Dict[str, object]] = []
+            for opt_df, opt_type in [(chain.calls, 'call'), (chain.puts, 'put')]:
+                for _, row in opt_df.iterrows():
+                    records.append({
+                        'expiry': expiry,
+                        'strike': float(row['strike']),
+                        'option_type': opt_type,
+                        'bid': float(row.get('bid', 0.0) or 0.0),
+                        'ask': float(row.get('ask', 0.0) or 0.0),
+                        'last': float(row.get('lastPrice', 0.0) or 0.0),
+                        'volume': int(row.get('volume', 0) or 0),
+                        'open_interest': int(row.get('openInterest', 0) or 0),
+                    })
+            return records
+        except Exception:
+            pass
     return []
 
 
 def fetch_underlying_price(symbol: str) -> Optional[float]:
-    """Fetch the current price of the underlying stock.  Returns None if no
-    data is available.  Implement this with your preferred market data API.
+    """Fetch the current price of the underlying stock.
+
+    When `USE_YFINANCE=true` and the optional `yfinance` library is
+    available, this function returns the most recent close price from
+    Yahoo Finance.  Otherwise it returns `None`.
     """
+    # Attempt to use yfinance for a real price if enabled
+    use_yf = os.getenv('USE_YFINANCE', 'false').lower() in {'1', 'true', 'yes'}
+    if use_yf and _HAS_YFINANCE:
+        try:
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(period='1d')
+            if not hist.empty:
+                # Use the last close price
+                return float(hist['Close'].iloc[-1])
+        except Exception:
+            pass
     return None
 
 def fetch_all_symbols() -> List[str]:
     """Return a broad universe of tradable symbols.
 
-    In a production scanner you might pull this list from an index (e.g.
-    S&P 500 constituents via an API) or from a brokerage’s universe of optionable
-    stocks.  This stub returns an empty list.  To enable scanning across the
-    entire market, implement this function accordingly.
+    Without external data sources this function returns an empty list.  To
+    scan the entire market you can manually load a list of optionable stocks
+    from a CSV file or package it into the repository.  Alternatively,
+    leave `SCAN_ALL=false` and provide a custom watch list via the
+    `SYMBOL_LIST` environment variable.
     """
     return []
 
@@ -415,24 +641,88 @@ def identify_candidate_trades(symbol: str) -> List[Tuple[str, Strategy]]:
     return candidates
 
 
-def scan_once(symbols: List[str]) -> None:
-    """Perform a single scan across a list of symbols and print results."""
+def select_trade(symbol: str, learner: Optional[ReinforcementLearner] = None) -> Optional[Tuple[str, Strategy]]:
+    """Select a single trade idea for a symbol using RL (if provided).
+
+    This wrapper uses `identify_candidate_trades` to generate candidate
+    strategies and then either returns the first candidate (if no learner) or
+    employs ε‑greedy selection via the provided `ReinforcementLearner`.  It
+    returns a tuple (description, strategy) or None if no candidates.
+    """
+    candidates = identify_candidate_trades(symbol)
+    if not candidates:
+        return None
+    # If no RL learner, simply choose the first candidate
+    if learner is None:
+        return candidates[0]
+    # Build the state and actions list
+    state = extract_state(symbol)
+    actions = [desc for desc, _ in candidates]
+    chosen_desc = learner.get_action(state, actions)
+    # Find the matching strategy
+    for desc, strat in candidates:
+        if desc == chosen_desc:
+            return (desc, strat)
+    # Fallback
+    return candidates[0]
+
+
+def scan_once(symbols: List[str], learner: Optional[ReinforcementLearner] = None, trade_log: Optional[List[TradeRecord]] = None) -> None:
+    """Perform a single scan across a list of symbols and print results.
+
+    If a `ReinforcementLearner` is supplied, the scanner will use it to
+    prioritise one trade per symbol.  All proposed trades can be stored in
+    `trade_log` for later analysis and learning.  In the absence of a
+    learner, the function behaves like the original scanner and prints all
+    candidate trades.
+    """
     for symbol in symbols:
         try:
-            ideas = identify_candidate_trades(symbol)
+            candidates = identify_candidate_trades(symbol)
         except Exception as exc:
             print(f"Error scanning {symbol}: {exc}")
             continue
-        if not ideas:
+        if not candidates:
             print(f"No trade ideas for {symbol}.")
             continue
-        print(f"\nTrade ideas for {symbol}:")
-        for desc, strat in ideas:
+        # Use RL selection if a learner is provided
+        if learner:
+            selection = select_trade(symbol, learner)
+            if selection is None:
+                print(f"No trade ideas for {symbol}.")
+                continue
+            desc, strat = selection
+            print(f"\nRecommended trade for {symbol}:")
+            print(f"  {desc}")
             max_gain = strat.max_gain()
             max_loss = strat.max_loss()
-            print(f"  {desc}")
             print(f"    Max gain: {max_gain if max_gain is not None else 'Unlimited'}")
             print(f"    Max loss: {max_loss if max_loss is not None else 'Unlimited'}")
+            # Record the recommendation for learning
+            if trade_log is not None:
+                record = TradeRecord(
+                    symbol=symbol,
+                    strategy_type=type(strat).__name__,
+                    entry_date=_dt.datetime.now().strftime('%Y-%m-%d'),
+                    exit_date=None,
+                    entry_price=fetch_underlying_price(symbol) or 0.0,
+                    exit_price=None,
+                    max_gain=max_gain,
+                    max_loss=max_loss,
+                    result=None,
+                    state=extract_state(symbol),
+                    next_state=None,
+                )
+                trade_log.append(record)
+        else:
+            # Default behaviour: list all candidate trades
+            print(f"\nTrade ideas for {symbol}:")
+            for desc, strat in candidates:
+                max_gain = strat.max_gain()
+                max_loss = strat.max_loss()
+                print(f"  {desc}")
+                print(f"    Max gain: {max_gain if max_gain is not None else 'Unlimited'}")
+                print(f"    Max loss: {max_loss if max_loss is not None else 'Unlimited'}")
 
 
 def parse_symbols() -> List[str]:
@@ -500,13 +790,21 @@ def main() -> None:
     print("Starting options scanner …")
     symbols = parse_symbols()
     scan_times = get_scan_times()
+    # Load historical trades and initialise the learner
+    learner = ReinforcementLearner()
+    trade_log = load_trade_records()
+    # Learn from previous records
+    if trade_log:
+        learn_from_records(learner, trade_log)
     # Immediately run one scan on start
     print(f"Initial scan at { _dt.datetime.now().strftime('%Y-%m-%d %H:%M') }")
-    scan_once(symbols)
+    scan_once(symbols, learner, trade_log)
+    save_trade_records(trade_log)
     while True:
         wait_until_next_scan(scan_times)
         print(f"\nRunning scheduled scan at { _dt.datetime.now().strftime('%Y-%m-%d %H:%M') }")
-        scan_once(symbols)
+        scan_once(symbols, learner, trade_log)
+        save_trade_records(trade_log)
 
 
 if __name__ == '__main__':
