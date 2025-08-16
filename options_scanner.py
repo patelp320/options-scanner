@@ -130,29 +130,80 @@ class OptionLeg:
 
 @dataclass
 class Strategy:
-    """Base class for options strategies."""
+    """Base class for options strategies.
+
+    A strategy consists of one or more option legs and an optional
+    underlying stock position.  Concrete subclasses implement
+    `max_gain` and `max_loss` for payoff analysis.
+    """
 
     legs: List[OptionLeg]
     underlying_quantity: int = 0  # positive for long stock, negative for short
 
     def payoff(self, price: float) -> float:
-        """Calculate total payoff (per share of stock) at expiration."""
+        """Calculate total payoff (per share of stock) at expiration.
+
+        Payoff includes both option legs and any underlying stock position.
+        """
         stock_payoff = self.underlying_quantity * (price - self.entry_price)
         option_payoff = sum(leg.payoff(price) for leg in self.legs)
         return stock_payoff + option_payoff
 
     @property
     def entry_price(self) -> float:
-        """Override in subclasses if needed to track entry price of underlying."""
+        """Entry price of the underlying stock.
+
+        Subclasses may override if they need to track an entry price.  By
+        default we assume zero, which effectively ignores stock payoff.
+        """
         return 0.0
 
     def max_gain(self) -> Optional[float]:
-        """Estimate maximum possible gain.  Returns None if unlimited."""
+        """Estimate maximum possible gain in dollars.
+
+        Returns None if unlimited or not easily quantified.  Subclasses
+        should override this method to provide a meaningful value.
+        """
         return None
 
     def max_loss(self) -> Optional[float]:
-        """Estimate maximum possible loss.  Returns None if unlimited."""
+        """Estimate maximum possible loss in dollars.
+
+        Returns None if unlimited or not easily quantified.  Subclasses
+        should override this method to provide a meaningful value.
+        """
         return None
+
+    def risk_reward_ratio(self) -> Optional[float]:
+        """Compute the ratio of maximum loss to maximum gain.
+
+        A lower ratio indicates a more favourable reward relative to the
+        potential risk.  Returns None if either max gain or max loss is
+        None (i.e. unlimited).
+        """
+        max_gain = self.max_gain()
+        max_loss = self.max_loss()
+        if max_gain is None or max_loss is None or max_gain == 0:
+            return None
+        return abs(max_loss) / max_gain
+
+    def risk_level(self) -> str:
+        """Categorise the strategy's risk level based on the risk/reward ratio.
+
+        - 'Low'   : ratio ≤ 0.5
+        - 'Medium': 0.5 < ratio ≤ 1.0
+        - 'High'  : ratio > 1.0 or undefined
+
+        Unlimited risk or unlimited reward results in 'High'.
+        """
+        ratio = self.risk_reward_ratio()
+        if ratio is None:
+            return 'High'
+        if ratio <= 0.5:
+            return 'Low'
+        if ratio <= 1.0:
+            return 'Medium'
+        return 'High'
 
 
 @dataclass
@@ -290,6 +341,16 @@ def fetch_underlying_price(symbol: str) -> Optional[float]:
     """
     return None
 
+def fetch_all_symbols() -> List[str]:
+    """Return a broad universe of tradable symbols.
+
+    In a production scanner you might pull this list from an index (e.g.
+    S&P 500 constituents via an API) or from a brokerage’s universe of optionable
+    stocks.  This stub returns an empty list.  To enable scanning across the
+    entire market, implement this function accordingly.
+    """
+    return []
+
 
 ###############################################################################
 # Scanner logic
@@ -324,9 +385,14 @@ def identify_candidate_trades(symbol: str) -> List[Tuple[str, Strategy]]:
             long_leg = OptionLeg('call', long['strike'], (long['ask'] + long['bid']) / 2, +1)
             short_leg = OptionLeg('call', short['strike'], (short['ask'] + short['bid']) / 2, -1)
             spread = VerticalSpread(legs=[long_leg, short_leg])
+            # Compute risk/reward ratio and descriptive string
+            ratio = spread.risk_reward_ratio()
+            risk_label = spread.risk_level()
+            ratio_str = f"{ratio:.2f}" if ratio is not None else '∞'
             desc = (
                 f"Bull call spread on {symbol}: buy {long_leg.strike} call @~{long_leg.premium:.2f}, "
-                f"sell {short_leg.strike} call @~{short_leg.premium:.2f}, expiring {long['expiry']}"
+                f"sell {short_leg.strike} call @~{short_leg.premium:.2f}, exp {long['expiry']}. "
+                f"Risk/Reward={ratio_str}, Risk Level={risk_label}"
             )
             candidates.append((desc, spread))
     # Example: create a bear put spread from top two puts with ascending strikes
@@ -337,9 +403,13 @@ def identify_candidate_trades(symbol: str) -> List[Tuple[str, Strategy]]:
             long_leg = OptionLeg('put', long['strike'], (long['ask'] + long['bid']) / 2, +1)
             short_leg = OptionLeg('put', short['strike'], (short['ask'] + short['bid']) / 2, -1)
             spread = VerticalSpread(legs=[long_leg, short_leg])
+            ratio = spread.risk_reward_ratio()
+            risk_label = spread.risk_level()
+            ratio_str = f"{ratio:.2f}" if ratio is not None else '∞'
             desc = (
                 f"Bear put spread on {symbol}: buy {long_leg.strike} put @~{long_leg.premium:.2f}, "
-                f"sell {short_leg.strike} put @~{short_leg.premium:.2f}, expiring {long['expiry']}"
+                f"sell {short_leg.strike} put @~{short_leg.premium:.2f}, exp {long['expiry']}. "
+                f"Risk/Reward={ratio_str}, Risk Level={risk_label}"
             )
             candidates.append((desc, spread))
     return candidates
@@ -366,7 +436,18 @@ def scan_once(symbols: List[str]) -> None:
 
 
 def parse_symbols() -> List[str]:
-    """Parse the SYMBOL_LIST environment variable into a list."""
+    """Determine the list of symbols to scan.
+
+    If the environment variable `SCAN_ALL` is set to "true" (case‑insensitive),
+    the function returns the full universe from `fetch_all_symbols()`.  Otherwise
+    it parses `SYMBOL_LIST` (a comma‑separated list).  If `SYMBOL_LIST` is not
+    provided, it defaults to the 30 Dow Jones Industrial Average constituents.
+    """
+    scan_all = os.getenv('SCAN_ALL', 'false').lower() in {'1', 'true', 'yes'}
+    if scan_all:
+        syms = fetch_all_symbols()
+        if syms:
+            return syms
     env = os.getenv('SYMBOL_LIST')
     if env:
         return [s.strip().upper() for s in env.split(',') if s.strip()]
