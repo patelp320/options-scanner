@@ -68,7 +68,19 @@ continuously learn from new data.
    `SCAN_ALL=true`, it will attempt to call `fetch_all_symbols()`.  Without
    external data this function returns an empty list; you can populate it
    manually or load a CSV of optionable stocks if desired.
-5. **Execution:**  The script prints proposed trades to the console.  It does
+5. **Execution:**  The script prints proposed trades to the console.  At
+   startup it performs a **pre‑market scan** using free `yfinance` data to
+   compute simple momentum and relative‑volume metrics, assigns a
+   rudimentary confidence score and prints a list of "GO" cards.  Each
+   card shows the trade description, confidence score, risk level and
+   estimated max gain/loss.  This approximates the "Best‑of‑Best"
+   watchlist described in the outline.  After printing the GO cards, it
+   runs the standard scan and reinforcement‑learning update.  The script does
+   *not* execute any trades; it merely surfaces ideas for manual review.  If
+   you decide to integrate with a broker API to place trades automatically,
+   ensure you implement appropriate safeguards and obtain explicit
+   confirmation before execution to comply with your broker’s terms and
+   relevant regulations.
    *not* execute any trades.  If you decide to integrate with a broker API to
    place trades automatically, ensure you implement appropriate safeguards and
    obtain explicit confirmation before execution to comply with your broker’s
@@ -111,9 +123,12 @@ scheduled run time.  To stop the program press `Ctrl+C`.
 
 ## Limitations and Future Work
 
-* **Live data:**  The scanner is not useful without real market data.
-  Implement data retrieval using a service like Finnhub, AlphaVantage or your
-  broker’s API.  Note that many free APIs do not include options data.
+* **Live data:**  The scanner’s pre‑market scan relies solely on free
+  `yfinance` data.  This data is delayed and may omit key fields such as
+  live bid/ask, IV surfaces and intraday volume.  To realise the full
+  capabilities outlined (DataGuard, NewsPulse, ShockGuard, etc.) you would
+  need streaming data from a vendor or broker API that includes options
+  quotes, greeks, implied volatility surfaces and news.
 * **Machine learning and reinforcement learning:**  A basic tabular
   reinforcement‑learning agent is provided as a proof of concept.  It
   discretises the market state and learns Q‑values for each action.  This
